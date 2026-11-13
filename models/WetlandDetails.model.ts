@@ -1,5 +1,4 @@
 
-
 export interface WetlandDetails {
     acreage: number;
     wetlandType: string;
@@ -11,10 +10,20 @@ export interface WetlandDetails {
     imageryDescription: string;
 }
 
+export interface WetlandIdentifyFeature {
+    layerId: number;
+    layerName: string;
+    displayFieldName?: string;
+    value?: string;
+    attributes: Record<string, unknown>;
+    geometryType?: string;
+    geometry?: unknown;
+}
 
 export interface WetlandExtractionResult {
     featureId: string;
     address: string;
     extractedAt: string;
-    general: WetlandDetails;
+    wetlandFeatures: WetlandIdentifyFeature[];
+    general: WetlandDetails | null;
 }
