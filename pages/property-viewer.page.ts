@@ -1,4 +1,3 @@
-
 import { Page, Locator, expect } from '@playwright/test';
 import type { Request, Response } from '@playwright/test';
 import type { WetlandDetails } from '../models/WetlandDetails.model';
@@ -28,10 +27,19 @@ interface IdentifyApiResponse {
   };
 }
 
+interface IdentifyAttemptDiagnostic {
+  attempt: number;
+  startedAt: string;
+  durationMs: number;
+  status: number | null;
+  responseReceived: boolean;
+  responseFeatureCount: number;
+  wetlandFeatureCount: number;
+  error: string | null;
+}
+
 // Convert either JSON or JSONP response into a JSON object.
-function parseIdentifyResponse(
-  responseText: string
-): IdentifyApiResponse {
+function parseIdentifyResponse(responseText: string): IdentifyApiResponse {
   const trimmedResponse = responseText.trim();
 
   if (!trimmedResponse) {
@@ -40,12 +48,8 @@ function parseIdentifyResponse(
 
   let jsonText = trimmedResponse;
 
-  // Standard JSON response.
-  if (trimmedResponse.startsWith('{')) {
-    jsonText = trimmedResponse;
-  } else {
-    // JSONP response:
-    // callbackFunction({...});
+  if (!trimmedResponse.startsWith('{')) {
+    // JSONP response: callbackFunction({...});
     const openingBracket = trimmedResponse.indexOf('(');
     const closingBracket = trimmedResponse.lastIndexOf(')');
 
@@ -54,9 +58,7 @@ function parseIdentifyResponse(
       closingBracket === -1 ||
       closingBracket <= openingBracket
     ) {
-      throw new Error(
-        'Unable to identify JSONP response boundaries.'
-      );
+      throw new Error('Unable to identify JSONP response boundaries.');
     }
 
     jsonText = trimmedResponse.substring(
@@ -73,6 +75,13 @@ export class PropertyViewerPage {
   private readonly map: Locator;
   private readonly addressSearch: Locator;
   private readonly generalInfo: Locator;
+
+  private readonly identifyEndpoint =
+    '/FWSWetlandsMapper/Wetlands/MapServer/identify';
+
+  private readonly identifyTimeoutMs = 30000;
+  private readonly maxIdentifyAttempts = 3;
+  private readonly popupTimeoutMs = 15000;
 
   constructor(page: Page) {
     this.page = page;
@@ -120,6 +129,7 @@ export class PropertyViewerPage {
       delay: 100
     });
 
+    // Allow the address autocomplete suggestions to populate.
     await this.page.waitForTimeout(1500);
 
     await this.addressSearch.press('ArrowDown');
@@ -129,9 +139,9 @@ export class PropertyViewerPage {
       exact: true
     }).click();
 
+    // The map application needs time to reposition after address search.
     await this.page.waitForTimeout(3000);
 
-    // Close visible Dismiss buttons.
     const dismissButtons = this.page.getByRole('button', {
       name: 'Dismiss',
       exact: true
@@ -144,7 +154,6 @@ export class PropertyViewerPage {
 
       if (await button.isVisible().catch(() => false)) {
         console.log('Closing visible modal using Dismiss button.');
-
         await button.click();
         await this.page.waitForTimeout(500);
       }
@@ -159,13 +168,11 @@ export class PropertyViewerPage {
   }
 
   // STEP 3: Select a map location and capture GIS Identify response.
+  // Retry only when the GIS response is missing or invalid.
+  // A slow popup after a valid GIS response does not trigger another map click.
   async selectMapFeature(
     coordinates: MapClick
   ): Promise<WetlandIdentifyFeature[]> {
-
-    const identifyEndpoint =
-      '/FWSWetlandsMapper/Wetlands/MapServer/identify';
-
     const capturedRequests: Array<{
       method: string;
       url: string;
@@ -185,51 +192,43 @@ export class PropertyViewerPage {
     }> = [];
 
     const capturedFinishedRequests: string[] = [];
+    const attemptDiagnostics: IdentifyAttemptDiagnostic[] = [];
 
     const requestListener = (request: Request): void => {
-      const url = request.url();
-
-      if (url.includes(identifyEndpoint)) {
+      if (request.url().includes(this.identifyEndpoint)) {
         capturedRequests.push({
           method: request.method(),
-          url,
+          url: request.url(),
           resourceType: request.resourceType()
         });
       }
     };
 
     const responseListener = (response: Response): void => {
-      const url = response.url();
-
-      if (url.includes(identifyEndpoint)) {
+      if (response.url().includes(this.identifyEndpoint)) {
         capturedResponses.push({
-          url,
+          url: response.url(),
           status: response.status(),
           resourceType: response.request().resourceType(),
-          contentType:
-            response.headers()['content-type'] ?? ''
+          contentType: response.headers()['content-type'] ?? ''
         });
 
         console.log(
-          'Identify response event captured:',
-          response.status(),
-          response.request().resourceType()
+          `Identify response event: HTTP ${response.status()}`
         );
       }
     };
 
     const requestFinishedListener = (request: Request): void => {
-      if (request.url().includes(identifyEndpoint)) {
+      if (request.url().includes(this.identifyEndpoint)) {
         capturedFinishedRequests.push(request.url());
       }
     };
 
     const requestFailedListener = (request: Request): void => {
-      const url = request.url();
-
-      if (url.includes(identifyEndpoint)) {
+      if (request.url().includes(this.identifyEndpoint)) {
         capturedFailures.push({
-          url,
+          url: request.url(),
           errorText: request.failure()?.errorText ?? 'Unknown error'
         });
       }
@@ -240,17 +239,12 @@ export class PropertyViewerPage {
     this.page.on('requestfinished', requestFinishedListener);
     this.page.on('requestfailed', requestFailedListener);
 
-    let identifyResponse: Response | null = null;
-    let clickError: unknown = null;
-    let responseBody = '';
-    let parsedResponse: IdentifyApiResponse = {};
+    let successfulResponse: Response | null = null;
+    let successfulResponseBody = '';
+    let successfulParsedResponse: IdentifyApiResponse = {};
+    let successfulFeatures: WetlandIdentifyFeature[] = [];
+    let successfulMapExtent: string | null = null;
 
-    let responseParsingError: string | null = null;
-
-    let originalPointerEvents: string | null = null;
-    let panelPointerEventsChanged = false;
-
-    let mapExtent: string | null = null;
     let mapBounds: {
       x: number;
       y: number;
@@ -260,29 +254,11 @@ export class PropertyViewerPage {
 
     let initialHitTest: unknown = null;
     let finalHitTest: unknown = null;
+    let popupReady = false;
+    let popupReadinessError: string | null = null;
+    let lastError = 'No Identify attempt was completed.';
 
-    // Response event promise.
-    let resolveIdentifyResponse:
-      (response: Response | null) => void = () => { };
-
-    const identifyResponsePromise = new Promise<Response | null>(
-      resolve => {
-        resolveIdentifyResponse = resolve;
-      }
-    );
-
-    // This listener is registered before the map click.
-    const identifyResponseListener = (response: Response): void => {
-      if (
-        response.url().includes(identifyEndpoint)
-      ) {
-        resolveIdentifyResponse(response);
-      }
-    };
-
-    this.page.on('response', identifyResponseListener);
-
-    let responseTimeout: ReturnType<typeof setTimeout> | undefined;
+    const overallStart = Date.now();
 
     try {
       await this.map.waitFor({
@@ -303,8 +279,9 @@ export class PropertyViewerPage {
         height: mapBox.height
       };
 
-      // Validate configured coordinates.
       if (
+        !Number.isFinite(coordinates.x) ||
+        !Number.isFinite(coordinates.y) ||
         coordinates.x < 0 ||
         coordinates.y < 0 ||
         coordinates.x >= mapBox.width ||
@@ -320,241 +297,319 @@ export class PropertyViewerPage {
       const absoluteY = mapBox.y + coordinates.y;
 
       console.log(
-        `Clicking map at X: ${coordinates.x}, Y: ${coordinates.y}`
+        `Map selection coordinates: X=${coordinates.x}, Y=${coordinates.y}`
       );
 
-      // Check which element receives the mouse click.
-      initialHitTest = await this.page.evaluate(
-        ({ x, y }) => {
-          const target = document.elementFromPoint(x, y);
-
-          return {
-            tagName: target?.tagName ?? null,
-            id: target?.id ?? null,
-            className:
-              typeof target?.className === 'string'
-                ? target.className
-                : null,
-            insideMap: !!target &&
-              document.querySelector('#mapDiv_gc')?.contains(target),
-            insideWetlandPanel: !!target?.closest('#wetlandDiv')
-          };
-        },
-        {
-          x: absoluteX,
-          y: absoluteY
-        }
-      );
-
-      console.log('Initial map hit test:', initialHitTest);
-
-      const hitTestResult = initialHitTest as {
-        insideMap: boolean;
-        insideWetlandPanel: boolean;
-      };
-
-      // If the wetland information panel blocks the map,
-      // temporarily allow the click to pass through it.
-      if (
-        !hitTestResult.insideMap &&
-        hitTestResult.insideWetlandPanel
+      for (
+        let attempt = 1;
+        attempt <= this.maxIdentifyAttempts;
+        attempt++
       ) {
-        const wetlandPanel = this.page.locator('#wetlandDiv');
+        const attemptStart = Date.now();
+        const startedAt = new Date().toISOString();
 
-        originalPointerEvents = await wetlandPanel.evaluate(
-          element => (element as HTMLElement).style.pointerEvents
-        );
+        let attemptResponse: Response | null = null;
+        let attemptBody = '';
+        let attemptParsed: IdentifyApiResponse = {};
+        let attemptFeatures: WetlandIdentifyFeature[] = [];
+        let attemptError: string | null = null;
 
-        await wetlandPanel.evaluate(element => {
-          (element as HTMLElement).style.pointerEvents = 'none';
-        });
-
-        panelPointerEventsChanged = true;
-
-        await this.page.waitForTimeout(200);
-
-        finalHitTest = await this.page.evaluate(
-          ({ x, y }) => {
-            const target = document.elementFromPoint(x, y);
-
-            return {
-              tagName: target?.tagName ?? null,
-              id: target?.id ?? null,
-              insideMap: !!target &&
-                document.querySelector('#mapDiv_gc')?.contains(target)
-            };
-          },
-          {
-            x: absoluteX,
-            y: absoluteY
-          }
-        );
-
-        console.log('Hit test after panel adjustment:', finalHitTest);
-
-        const finalResult = finalHitTest as {
-          insideMap: boolean;
-        };
-
-        if (!finalResult.insideMap) {
-          throw new Error(
-            'The map is still blocked after temporarily adjusting #wetlandDiv.'
-          );
-        }
-      } else if (!hitTestResult.insideMap) {
-        throw new Error(
-          'The map click is blocked by an unexpected element. ' +
-          `Hit test: ${JSON.stringify(initialHitTest)}`
-        );
-      }
-
-      // Set up a timeout for the response event.
-      // The listener was registered before the click.
-      const responseTimeoutPromise = new Promise<null>(resolve => {
-        responseTimeout = setTimeout(() => {
-          resolve(null);
-        }, 20000);
-      });
-
-      console.log('Waiting for GIS Identify response...');
-
-      // Perform exactly one mouse click.
-      await this.page.mouse.click(absoluteX, absoluteY);
-
-      identifyResponse = await Promise.race([
-        identifyResponsePromise,
-        responseTimeoutPromise
-      ]);
-
-      if (identifyResponse) {
-        console.log('IDENTIFY RESPONSE RECEIVED.');
-        console.log(
-          'IDENTIFY RESPONSE STATUS:',
-          identifyResponse.status()
-        );
+        let originalPointerEvents: string | null = null;
+        let panelPointerEventsChanged = false;
 
         console.log(
-          'IDENTIFY RESOURCE TYPE:',
-          identifyResponse.request().resourceType()
-        );
-
-        if (!identifyResponse.ok()) {
-          throw new Error(
-            `GIS Identify API returned HTTP ${identifyResponse.status()}`
-          );
-        }
-
-        responseBody = await identifyResponse.text();
-
-        console.log(
-          'IDENTIFY RESPONSE BODY:',
-          responseBody
+          `Identify attempt ${attempt}/${this.maxIdentifyAttempts} started.`
         );
 
         try {
-          parsedResponse = parseIdentifyResponse(responseBody);
+          // Check which element will receive the map click.
+          initialHitTest = await this.page.evaluate(
+            ({ x, y }) => {
+              const target = document.elementFromPoint(x, y);
+              const mapElement = document.querySelector('#mapDiv_gc');
 
-        } catch (error) {
-          responseParsingError = String(error);
-
-          throw new Error(
-            `Unable to parse GIS Identify response: ${responseParsingError}`
+              return {
+                tagName: target?.tagName ?? null,
+                id: target?.id ?? null,
+                className:
+                  typeof target?.className === 'string'
+                    ? target.className
+                    : null,
+                insideMap: !!target && !!mapElement?.contains(target),
+                insideWetlandPanel: !!target?.closest('#wetlandDiv')
+              };
+            },
+            { x: absoluteX, y: absoluteY }
           );
+
+          console.log('Map hit test:', initialHitTest);
+
+          const hitTest = initialHitTest as {
+            insideMap: boolean;
+            insideWetlandPanel: boolean;
+          };
+
+          if (!hitTest.insideMap && hitTest.insideWetlandPanel) {
+            const wetlandPanel = this.page.locator('#wetlandDiv');
+
+            originalPointerEvents = await wetlandPanel.evaluate(
+              element => (element as HTMLElement).style.pointerEvents
+            );
+
+            await wetlandPanel.evaluate(element => {
+              (element as HTMLElement).style.pointerEvents = 'none';
+            });
+
+            panelPointerEventsChanged = true;
+
+            finalHitTest = await this.page.evaluate(
+              ({ x, y }) => {
+                const target = document.elementFromPoint(x, y);
+
+                return {
+                  tagName: target?.tagName ?? null,
+                  id: target?.id ?? null,
+                  insideMap: !!target &&
+                    !!document.querySelector('#mapDiv_gc')?.contains(target)
+                };
+              },
+              { x: absoluteX, y: absoluteY }
+            );
+
+            console.log('Hit test after panel adjustment:', finalHitTest);
+
+            const finalResult = finalHitTest as {
+              insideMap: boolean;
+            };
+
+            if (!finalResult.insideMap) {
+              throw new Error(
+                'The map is still blocked after adjusting #wetlandDiv.'
+              );
+            }
+          } else if (!hitTest.insideMap) {
+            throw new Error(
+              'The map click is blocked by an unexpected element. ' +
+              `Hit test: ${JSON.stringify(initialHitTest)}`
+            );
+          }
+
+          // Register the response waiter BEFORE clicking.
+          // Convert rejection into a result so it cannot become unhandled
+          // if the mouse click itself fails.
+          const responseResultPromise = this.page.waitForResponse(
+            response =>
+              response.url().includes(this.identifyEndpoint),
+            {
+              timeout: this.identifyTimeoutMs
+            }
+          ).then(
+            response => ({
+              response,
+              error: null as Error | null
+            }),
+            error => ({
+              response: null,
+              error: error as Error
+            })
+          );
+
+          console.log(
+            `Waiting up to ${this.identifyTimeoutMs / 1000} seconds ` +
+            'for the GIS Identify response...'
+          );
+
+          await this.page.mouse.click(absoluteX, absoluteY);
+
+          const responseResult = await responseResultPromise;
+
+          if (!responseResult.response) {
+            throw new Error(
+              `Identify response timeout: ${
+                responseResult.error?.message ?? 'No response received.'
+              }`
+            );
+          }
+
+          attemptResponse = responseResult.response;
+
+          console.log(
+            `Identify response received in ${Date.now() - attemptStart} ms.`
+          );
+
+          if (!attemptResponse.ok()) {
+            throw new Error(
+              `GIS Identify API returned HTTP ${attemptResponse.status()}.`
+            );
+          }
+
+          attemptBody = await attemptResponse.text();
+          attemptParsed = parseIdentifyResponse(attemptBody);
+
+          if (attemptParsed.error) {
+            throw new Error(
+              `GIS Identify error: ${
+                attemptParsed.error.message ?? 'Unknown GIS error'
+              }`
+            );
+          }
+
+          const identifyResults = attemptParsed.results ?? [];
+
+          attemptFeatures = identifyResults.filter(
+            feature => feature.layerId === 1
+          );
+
+          if (attemptFeatures.length === 0) {
+            throw new Error(
+              'Identify response did not contain a Layer 1 ' +
+              'Wetlands_CONUS_East feature.'
+            );
+          }
+
+          // A valid GIS response has been received. Do not repeat the
+          // map click merely because the popup takes longer to render.
+          successfulResponse = attemptResponse;
+          successfulResponseBody = attemptBody;
+          successfulParsedResponse = attemptParsed;
+          successfulFeatures = attemptFeatures;
+
+          const requestUrl = new URL(attemptResponse.url());
+          successfulMapExtent =
+            requestUrl.searchParams.get('mapExtent');
+
+          attemptDiagnostics.push({
+            attempt,
+            startedAt,
+            durationMs: Date.now() - attemptStart,
+            status: attemptResponse.status(),
+            responseReceived: true,
+            responseFeatureCount: identifyResults.length,
+            wetlandFeatureCount: attemptFeatures.length,
+            error: null
+          });
+
+          console.log(
+            `Valid wetland response received. ` +
+            `Wetland feature count: ${attemptFeatures.length}.`
+          );
+
+          break;
+        } catch (error) {
+          attemptError =
+            error instanceof Error ? error.message : String(error);
+
+          lastError = attemptError;
+
+          attemptDiagnostics.push({
+            attempt,
+            startedAt,
+            durationMs: Date.now() - attemptStart,
+            status: attemptResponse?.status() ?? null,
+            responseReceived: attemptResponse !== null,
+            responseFeatureCount: attemptParsed.results?.length ?? 0,
+            wetlandFeatureCount: attemptFeatures.length,
+            error: attemptError
+          });
+
+          console.error(
+            `Identify attempt ${attempt} failed: ${attemptError}`
+          );
+
+          if (attempt < this.maxIdentifyAttempts) {
+            console.log('Preparing controlled retry...');
+          }
+        } finally {
+          // Always restore the panel's original inline setting.
+          if (panelPointerEventsChanged) {
+            await this.page.locator('#wetlandDiv').evaluate(
+              (element, originalValue) => {
+                (element as HTMLElement).style.pointerEvents =
+                  originalValue ?? '';
+              },
+              originalPointerEvents
+            ).catch(() => undefined);
+          }
         }
 
-        const requestUrl = new URL(identifyResponse.url());
-        mapExtent = requestUrl.searchParams.get('mapExtent');
+        if (successfulResponse) {
+          break;
+        }
 
-      } else {
-        console.error(
-          'No Identify response event was received within 20 seconds.'
-        );
+        if (attempt < this.maxIdentifyAttempts) {
+          await this.page.waitForTimeout(1000);
+        }
       }
-
-      await this.page.waitForTimeout(1000);
-
-    } catch (error) {
-      clickError = error;
-
     } finally {
-      if (responseTimeout) {
-        clearTimeout(responseTimeout);
-      }
-
-      // Restore the original panel setting.
-      if (panelPointerEventsChanged) {
-        await this.page.locator('#wetlandDiv').evaluate(
-          (element, originalValue) => {
-            (element as HTMLElement).style.pointerEvents =
-              originalValue ?? '';
-          },
-          originalPointerEvents
-        ).catch(() => undefined);
-      }
-
       this.page.off('request', requestListener);
       this.page.off('response', responseListener);
-      this.page.off('response', identifyResponseListener);
       this.page.off('requestfinished', requestFinishedListener);
       this.page.off('requestfailed', requestFailedListener);
     }
 
-    const identifyFeatures = parsedResponse.results ?? [];
+    // The popup is a secondary UI confirmation. Its delay must not
+    // invalidate a successful GIS API response.
+    if (successfulResponse && successfulFeatures.length > 0) {
+      const popupStart = Date.now();
 
-    // Keep only actual wetland features from Layer 1.
-    const wetlandFeatures = identifyFeatures.filter(
-      feature => feature.layerId === 1
-    );
+      try {
+        await this.waitForGeneralTab(this.popupTimeoutMs);
+        popupReady = true;
 
-    const identifyPanelVisible = await this.generalInfo
-      .isVisible()
-      .catch(() => false);
+        console.log(
+          `General tab became ready in ${Date.now() - popupStart} ms.`
+        );
+      } catch (error) {
+        popupReadinessError =
+          error instanceof Error ? error.message : String(error);
 
-    // Save diagnostics.
+        console.warn(
+          'GIS data is valid, but General tab content is not ready yet: ' +
+          popupReadinessError
+        );
+      }
+    }
+
     const diagnosticData = {
       capturedAt: new Date().toISOString(),
-
-      clickedCoordinates: coordinates,
-
+      totalDurationMs: Date.now() - overallStart,
+      configuredCoordinates: coordinates,
       mapBounds,
-
-      mapExtent,
-
+      mapExtent: successfulMapExtent,
       initialHitTest,
-
       finalHitTest,
-
-      capturedRequests,
-
-      capturedResponses,
-
-      capturedFinishedRequests,
-
-      capturedFailures,
-
-      identifyResponseDetails: {
-        received: identifyResponse !== null,
-        status: identifyResponse?.status() ?? null,
-        resourceType:
-          identifyResponse?.request().resourceType() ?? null,
-        count: identifyFeatures.length,
-        wetlandFeatureCount: wetlandFeatures.length,
-        parsingError: responseParsingError
+      retryConfiguration: {
+        maxAttempts: this.maxIdentifyAttempts,
+        responseTimeoutMs: this.identifyTimeoutMs
       },
-
-      identifyResponseData: identifyResponse
-        ? {
-          url: identifyResponse.url(),
-          status: identifyResponse.status(),
-          contentType:
-            identifyResponse.headers()['content-type'] ?? '',
-          body: responseBody
-        }
-        : null,
-
+      attempts: attemptDiagnostics,
+      capturedRequests,
+      capturedResponses,
+      capturedFinishedRequests,
+      capturedFailures,
+      identifyResponseDetails: {
+        received: successfulResponse !== null,
+        status: successfulResponse?.status() ?? null,
+        resourceType:
+          successfulResponse?.request().resourceType() ?? null,
+        totalResultCount:
+          successfulParsedResponse.results?.length ?? 0,
+        wetlandFeatureCount: successfulFeatures.length
+      },
       applicationResponse: {
-        identifyPanelVisible
-      }
+        generalTabReady: popupReady,
+        popupReadinessError
+      },
+      lastError,
+      identifyResponseData: successfulResponse
+        ? {
+            url: successfulResponse.url(),
+            status: successfulResponse.status(),
+            contentType:
+              successfulResponse.headers()['content-type'] ?? '',
+            body: successfulResponseBody
+          }
+        : null
     };
 
     const diagnosticDirectory = path.join(
@@ -574,57 +629,55 @@ export class PropertyViewerPage {
     );
 
     console.log(
-      'MAP DIAGNOSTICS:',
+      'IDENTIFY DIAGNOSTICS:',
       JSON.stringify(diagnosticData, null, 2)
     );
 
-    if (clickError) {
-      throw clickError;
-    }
-
-    if (!identifyResponse) {
+    if (!successfulResponse || successfulFeatures.length === 0) {
       throw new Error(
-        'Identify response was not received within 20 seconds. ' +
-        'Check capturedRequests, capturedResponses, ' +
-        'capturedFinishedRequests and capturedFailures in map-structure.json.'
-      );
-    }
-
-    if (parsedResponse.error) {
-      throw new Error(
-        `GIS Identify error: ${parsedResponse.error.message ?? 'Unknown error'}`
-      );
-    }
-
-    if (wetlandFeatures.length === 0) {
-      throw new Error(
-        'The Identify response did not contain a Layer 1 wetland feature.'
+        `Unable to identify a valid wetland feature after ` +
+        `${this.maxIdentifyAttempts} attempts. Last error: ${lastError}. ` +
+        'Check test-results/diagnostics/map-structure.json.'
       );
     }
 
     console.log(
-      `Successfully extracted ${wetlandFeatures.length} wetland feature(s).`
+      `Successfully extracted ${successfulFeatures.length} wetland feature(s).`
     );
 
-    return wetlandFeatures;
+    return successfulFeatures;
   }
 
-  // STEP 4: Wait for General tab data.
-  private async waitForGeneralTab(): Promise<void> {
+  // STEP 4: Wait until General tab fields are visible AND populated.
+  private async waitForGeneralTab(
+    timeout = 30000
+  ): Promise<void> {
     await expect(this.generalInfo).toBeVisible({
-      timeout: 30000
+      timeout
     });
 
-    await expect(
-      this.generalInfo.locator('#acreage')
-    ).toBeVisible({
-      timeout: 30000
-    });
+    const requiredFields = [
+      '#acreage',
+      '#wetlandType',
+      '#wetlandCode'
+    ];
+
+    for (const selector of requiredFields) {
+      const field = this.generalInfo.locator(selector);
+
+      await expect(field).toBeVisible({
+        timeout
+      });
+
+      await expect(field).not.toHaveText(/^\s*$/, {
+        timeout
+      });
+    }
   }
 
   // STEP 5: Extract only General tab information.
   async extractGeneralTab(): Promise<WetlandDetails> {
-    await this.waitForGeneralTab();
+    await this.waitForGeneralTab(30000);
 
     const acreageText = (
       await this.generalInfo.locator('#acreage').innerText()
@@ -638,36 +691,47 @@ export class PropertyViewerPage {
       await this.generalInfo.locator('#wetlandCode').innerText()
     ).trim();
 
-    const imageScale = (
-      await this.generalInfo
-        .locator('#imageScalePopup b')
-        .first()
-        .innerText()
-    ).trim();
+    const imageScaleLocator = this.generalInfo
+      .locator('#imageScalePopup b')
+      .first();
 
-    const imageryType = (
-      await this.generalInfo
-        .locator('#sourceTypePopup b')
-        .nth(0)
-        .innerText()
-    ).trim();
+    const imageryTypeLocator = this.generalInfo
+      .locator('#sourceTypePopup b')
+      .nth(0);
 
-    const imageYearText = (
-      await this.generalInfo
-        .locator('#sourceTypePopup b')
-        .nth(1)
-        .innerText()
-    ).trim();
+    const imageYearLocator = this.generalInfo
+      .locator('#sourceTypePopup b')
+      .nth(1);
+
+    await expect(imageScaleLocator).not.toHaveText(/^\s*$/);
+    await expect(imageryTypeLocator).not.toHaveText(/^\s*$/);
+    await expect(imageYearLocator).not.toHaveText(/^\s*$/);
+
+    const imageScale = (await imageScaleLocator.innerText()).trim();
+    const imageryType = (await imageryTypeLocator.innerText()).trim();
+    const imageYearText = (await imageYearLocator.innerText()).trim();
 
     const acreage = Number(acreageText);
     const imageYear = Number(imageYearText);
 
     if (
       Number.isNaN(acreage) ||
-      Number.isNaN(imageYear)
+      Number.isNaN(imageYear) ||
+      !wetlandType ||
+      !classification ||
+      !imageScale ||
+      !imageryType
     ) {
       throw new Error(
-        'Invalid acreage or image year extracted from General tab.'
+        'Invalid or incomplete information extracted from General tab. ' +
+        JSON.stringify({
+          acreageText,
+          wetlandType,
+          classification,
+          imageScale,
+          imageryType,
+          imageYearText
+        })
       );
     }
 
